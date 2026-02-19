@@ -301,8 +301,13 @@ class Qwen3TTSModelForGeneration(nn.Module):
                 },
             )
         except StopIteration:
-            # Generator exhausted
+            # Generator exhausted — clean up state
+            self._streaming_state.pop(request_id, None)
             return OmniOutput(text_hidden_states=None, multimodal_outputs={"finished": torch.tensor(True)})
+        except Exception:
+            # Clean up state on any error to prevent leaks
+            self._streaming_state.pop(request_id, None)
+            raise
 
     def make_omni_output(self, model_outputs: torch.Tensor | OmniOutput | tuple, **kwargs: Any) -> OmniOutput:
         """
