@@ -15,9 +15,11 @@
 
 import json
 import os
-from collections.abc import Callable
+from collections.abc import Callable, Generator
 from dataclasses import dataclass
+from typing import Any
 
+import numpy as np
 import torch
 from librosa.filters import mel as librosa_mel_fn
 from torch import nn
@@ -44,7 +46,7 @@ from transformers.utils import can_return_tuple, logging
 from transformers.utils.hub import cached_file
 
 from vllm_omni.model_executor.model_loader.weight_utils import download_weights_from_hf_specific
-
+from vllm_omni.outputs import AsyncDecodingPipeline, StreamingChunkOutput
 from .configuration_qwen3_tts import (
     Qwen3TTSConfig,
     Qwen3TTSSpeakerEncoderConfig,
@@ -1648,6 +1650,9 @@ class Qwen3TTSTalkerForConditionalGeneration(Qwen3TTSTalkerTextPreTrainedModel, 
         # Generate
         else:
             last_id_hidden = self.get_input_embeddings()(input_ids)
+            # Suppress tokens >= 2048 for code_predictor (decoder codebook only has 2048 entries)
+            CODEC_VALID_MAX = 2048
+            code_predictor_suppress_tokens = list(range(CODEC_VALID_MAX, self.code_predictor.config.vocab_size))
             predictor_result = self.code_predictor.generate(
                 inputs_embeds=torch.cat((past_hidden, last_id_hidden), dim=1),
                 max_new_tokens=self.config.num_code_groups - 1,
@@ -1657,6 +1662,7 @@ class Qwen3TTSTalkerForConditionalGeneration(Qwen3TTSTalkerTextPreTrainedModel, 
                 temperature=subtalker_temperature,
                 output_hidden_states=True,
                 return_dict_in_generate=True,
+                suppress_tokens=code_predictor_suppress_tokens,
             )
             codec_ids = torch.cat((input_ids, predictor_result.sequences), dim=-1)
             codec_hiddens = torch.cat(
@@ -1791,6 +1797,245 @@ class Qwen3TTSTalkerForConditionalGeneration(Qwen3TTSTalkerTextPreTrainedModel, 
         model_kwargs["trailing_text_hidden"] = outputs.trailing_text_hidden
         model_kwargs["tts_pad_embed"] = outputs.tts_pad_embed
         return model_kwargs
+
+    @torch.no_grad()
+    def generate_streaming_iter(
+        self,
+        inputs_embeds: torch.Tensor,
+        attention_mask: torch.Tensor,
+        trailing_text_hidden: torch.Tensor,
+        tts_pad_embed: torch.Tensor,
+        chunk_size: int = 25,
+        max_new_tokens: int = 4096,
+        do_sample: bool = True,
+        top_k: int = 50,
+        top_p: float = 1.0,
+        temperature: float = 0.9,
+        subtalker_dosample: bool = True,
+        subtalker_top_k: int = 50,
+        subtalker_top_p: float = 1.0,
+        subtalker_temperature: float = 0.9,
+        eos_token_id: int | None = None,
+        repetition_penalty: float = 1.05,
+        suppress_tokens: list[int] | None = None,
+        **kwargs,
+    ) -> Generator[StreamingChunkOutput, None, None]:
+        """
+        Streaming generation iterator that yields codec tokens in chunks.
+
+        This method generates talker codes incrementally and yields them in chunks
+        of `chunk_size` tokens, enabling real-time processing.
+
+        The sampling logic is designed to match HuggingFace GenerationMixin.generate()
+        to ensure identical outputs between streaming and blocking modes.
+
+        Args:
+            inputs_embeds: Input embeddings for the talker model
+            attention_mask: Attention mask for the input
+            trailing_text_hidden: Hidden states for trailing text
+            tts_pad_embed: Padding embedding
+            chunk_size: Number of tokens per chunk to yield
+            max_new_tokens: Maximum number of new tokens to generate
+            do_sample: Whether to use sampling
+            top_k: Top-k sampling parameter
+            top_p: Top-p sampling parameter
+            temperature: Sampling temperature
+            subtalker_dosample: Whether to use sampling for subtalker
+            subtalker_top_k: Subtalker top-k parameter
+            subtalker_top_p: Subtalker top-p parameter
+            subtalker_temperature: Subtalker temperature
+            eos_token_id: End of sequence token ID
+            repetition_penalty: Repetition penalty
+            suppress_tokens: List of token ids to suppress (set to -inf)
+
+        Yields:
+            StreamingChunkOutput: Contains codec codes and metadata for each chunk
+        """
+        if eos_token_id is None:
+            eos_token_id = self.config.codec_eos_token_id
+
+        # Suppress certain tokens (same as blocking generate)
+        if suppress_tokens is None:
+            suppress_tokens = [
+                i for i in range(self.config.vocab_size - 1024, self.config.vocab_size) if i not in (eos_token_id,)
+            ]
+
+        # Convert suppress_tokens to tensor for efficient masking
+        suppress_tokens_tensor = torch.tensor(suppress_tokens, device=inputs_embeds.device)
+
+        # Initialize cache and generation state
+        past_key_values = DynamicCache()
+        cache_position = torch.arange(inputs_embeds.shape[1], device=inputs_embeds.device)
+
+        # Prefill phase
+        outputs = self.forward(
+            inputs_embeds=inputs_embeds,
+            attention_mask=attention_mask,
+            past_key_values=past_key_values,
+            use_cache=True,
+            cache_position=cache_position,
+            trailing_text_hidden=trailing_text_hidden,
+            tts_pad_embed=tts_pad_embed,
+            generation_step=0,
+            subtalker_dosample=subtalker_dosample,
+            subtalker_top_k=subtalker_top_k,
+            subtalker_top_p=subtalker_top_p,
+            subtalker_temperature=subtalker_temperature,
+            output_hidden_states=True,
+        )
+
+        past_key_values = outputs.past_key_values
+        past_hidden = outputs.past_hidden
+        generation_step = outputs.generation_step
+
+        # Token accumulator for chunking
+        accumulated_codes: list[torch.Tensor] = []
+        accumulated_hidden: list[torch.Tensor] = []
+        total_generated = 0
+        chunk_idx = 0
+
+        # Repetition penalty tracking - use tensor for efficient lookup
+        generated_ids: list[int] = []
+
+        for step in range(max_new_tokens):
+            # Get logits for next token
+            logits = outputs.logits[:, -1, :].clone()  # [batch, vocab], clone to avoid in-place modification
+
+            # Step 1: Apply repetition penalty (same as HuggingFace RepetitionPenaltyLogitsProcessor)
+            if repetition_penalty != 1.0 and len(generated_ids) > 0:
+                # Create a tensor of unique generated ids for vectorized operation
+                unique_ids = list(set(generated_ids))
+                for token_id in unique_ids:
+                    # HuggingFace style: score < 0 -> multiply by penalty, score > 0 -> divide by penalty
+                    if logits[0, token_id] < 0:
+                        logits[0, token_id] = logits[0, token_id] * repetition_penalty
+                    else:
+                        logits[0, token_id] = logits[0, token_id] / repetition_penalty
+
+            # Step 2: Apply suppress_tokens (set to -inf so they won't be sampled)
+            if len(suppress_tokens) > 0:
+                logits[:, suppress_tokens_tensor] = float("-inf")
+
+            # Step 3: Sample or greedy
+            if do_sample:
+                # Apply temperature FIRST (before top-k/top-p, matching HuggingFace TemperatureLogitsWarper)
+                if temperature != 1.0 and temperature > 0:
+                    logits = logits / temperature
+
+                # Top-k filtering (HuggingFace TopKLogitsWarper style)
+                if top_k > 0 and top_k < logits.size(-1):
+                    # Get the top-k threshold
+                    top_k_values, _ = torch.topk(logits, min(top_k, logits.size(-1)))
+                    threshold = top_k_values[..., -1, None]
+                    # Remove tokens with logits below threshold
+                    logits = torch.where(logits < threshold, torch.tensor(float("-inf"), device=logits.device), logits)
+
+                # Top-p (nucleus) filtering (HuggingFace TopPLogitsWarper style)
+                if top_p < 1.0:
+                    sorted_logits, sorted_indices = torch.sort(logits, descending=True)
+                    cumulative_probs = torch.cumsum(F.softmax(sorted_logits, dim=-1), dim=-1)
+
+                    # Remove tokens with cumulative probability above the threshold
+                    sorted_indices_to_remove = cumulative_probs > top_p
+                    # Keep at least one token (shift right and set first to False)
+                    sorted_indices_to_remove[..., 1:] = sorted_indices_to_remove[..., :-1].clone()
+                    sorted_indices_to_remove[..., 0] = False
+
+                    # Scatter back to original indexing
+                    indices_to_remove = sorted_indices_to_remove.scatter(
+                        dim=1, index=sorted_indices, src=sorted_indices_to_remove
+                    )
+                    logits = logits.masked_fill(indices_to_remove, float("-inf"))
+
+                # Sample from the filtered distribution
+                probs = F.softmax(logits, dim=-1)
+                next_token = torch.multinomial(probs, num_samples=1)
+            else:
+                # Greedy decoding
+                next_token = torch.argmax(logits, dim=-1, keepdim=True)
+
+            next_token_id = next_token.item()
+            generated_ids.append(next_token_id)
+
+            # Check for EOS
+            is_eos = next_token_id == eos_token_id
+
+            # Update attention mask
+            attention_mask = torch.cat(
+                [attention_mask, torch.ones((1, 1), device=attention_mask.device, dtype=attention_mask.dtype)],
+                dim=1,
+            )
+            cache_position = torch.tensor([cache_position[-1] + 1], device=inputs_embeds.device)
+
+            # Forward pass for next token
+            outputs = self.forward(
+                input_ids=next_token,
+                attention_mask=attention_mask,
+                past_key_values=past_key_values,
+                use_cache=True,
+                cache_position=cache_position,
+                past_hidden=past_hidden,
+                trailing_text_hidden=trailing_text_hidden,
+                tts_pad_embed=tts_pad_embed,
+                generation_step=generation_step,
+                subtalker_dosample=subtalker_dosample,
+                subtalker_top_k=subtalker_top_k,
+                subtalker_top_p=subtalker_top_p,
+                subtalker_temperature=subtalker_temperature,
+                output_hidden_states=True,
+            )
+
+            past_key_values = outputs.past_key_values
+            past_hidden = outputs.past_hidden
+            generation_step = outputs.generation_step
+
+            # Get codec_ids from hidden_states (contains tuple of (hidden_states, codec_ids))
+            codec_ids = outputs.hidden_states[1]  # [batch, num_quantizers]
+
+            if codec_ids is not None:
+                # Check if any codec layer contains EOS token (should terminate)
+                if (codec_ids == eos_token_id).any():
+                    is_eos = True
+
+                accumulated_codes.append(codec_ids[0])  # Remove batch dim
+                if outputs.hidden_states[0] is not None:
+                    accumulated_hidden.append(past_hidden[0, 0, :])
+                total_generated += 1
+
+            # Yield chunk if accumulated enough or finished
+            if len(accumulated_codes) >= chunk_size or is_eos:
+                if len(accumulated_codes) > 0:
+                    chunk_codes = torch.stack(accumulated_codes, dim=0)  # [chunk_size, num_quantizers]
+                    chunk_hidden = torch.stack(accumulated_hidden, dim=0) if accumulated_hidden else None
+
+                    yield StreamingChunkOutput(
+                        codec_codes=chunk_codes,
+                        hidden_states=chunk_hidden,
+                        chunk_idx=chunk_idx,
+                        is_finished=is_eos,
+                        total_generated=total_generated,
+                    )
+
+                    accumulated_codes = []
+                    accumulated_hidden = []
+                    chunk_idx += 1
+
+
+            if is_eos or max_new_tokens is not None and total_generated >= max_new_tokens:
+                break
+
+        # Yield any remaining tokens
+        if len(accumulated_codes) > 0:
+            chunk_codes = torch.stack(accumulated_codes, dim=0)
+            chunk_hidden = torch.stack(accumulated_hidden, dim=0) if accumulated_hidden else None
+
+            yield StreamingChunkOutput(
+                codec_codes=chunk_codes,
+                hidden_states=chunk_hidden,
+                chunk_idx=chunk_idx,
+                is_finished=True,
+                total_generated=total_generated,
+            )
 
 
 class Qwen3TTSForConditionalGeneration(Qwen3TTSPreTrainedModel, GenerationMixin):
@@ -2030,7 +2275,6 @@ class Qwen3TTSForConditionalGeneration(Qwen3TTSPreTrainedModel, GenerationMixin)
     ):
         talker_kwargs = {
             "max_new_tokens": max_new_tokens,
-            "min_new_tokens": 2,
             "do_sample": do_sample,
             "top_k": top_k,
             "top_p": top_p,
@@ -2317,10 +2561,533 @@ class Qwen3TTSForConditionalGeneration(Qwen3TTSPreTrainedModel, GenerationMixin)
 
         return talker_codes_list, talker_hidden_states_list
 
+    @torch.no_grad()
+    def generate_streaming(
+        self,
+        input_ids: list[torch.Tensor] | None = None,
+        instruct_ids: list[torch.Tensor] | None = None,
+        ref_ids: list[torch.Tensor] | None = None,
+        voice_clone_prompt: dict[str, list[Any]] | None = None,
+        languages: list[str] = None,
+        speakers: list[str] = None,
+        non_streaming_mode: bool = False,
+        max_new_tokens: int = 4096,
+        do_sample: bool = True,
+        top_k: int = 50,
+        top_p: float = 1.0,
+        temperature: float = 0.9,
+        subtalker_dosample: bool = True,
+        subtalker_top_k: int = 50,
+        subtalker_top_p: float = 1.0,
+        subtalker_temperature: float = 0.9,
+        eos_token_id: int | None = None,
+        repetition_penalty: float = 1.05,
+        chunk_size: int = 25,
+        left_context_size: int = 25,
+        **kwargs: Any,
+    ) -> Generator[tuple[np.ndarray, bool, int], None, None]:
+        """
+        True streaming generation method that yields audio chunks as tokens are generated.
+
+        This method generates talker codes incrementally and decodes them to audio
+        in parallel, enabling real-time audio streaming output. Unlike the previous
+        implementation, this truly streams - it yields audio chunks while still
+        generating subsequent tokens.
+
+        Args:
+            input_ids: Input token IDs for the text to synthesize
+            instruct_ids: Optional instruction token IDs
+            ref_ids: Optional reference audio token IDs for voice cloning
+            voice_clone_prompt: Voice cloning prompt configuration
+            languages: Language codes for each sample
+            speakers: Speaker IDs for each sample
+            non_streaming_mode: If True, wait for full text before generating
+            max_new_tokens: Maximum number of new tokens to generate
+            do_sample: Whether to use sampling for generation
+            top_k: Top-k sampling parameter
+            top_p: Top-p (nucleus) sampling parameter
+            temperature: Sampling temperature
+            subtalker_dosample: Whether to use sampling for subtalker
+            subtalker_top_k: Subtalker top-k parameter
+            subtalker_top_p: Subtalker top-p parameter
+            subtalker_temperature: Subtalker temperature
+            eos_token_id: End of sequence token ID
+            repetition_penalty: Repetition penalty for generation
+            chunk_size: Number of codec frames per audio chunk (default 25)
+            left_context_size: Context frames for smooth chunk boundaries (default 25)
+            **kwargs: Additional generation arguments
+
+        Yields:
+            tuple[np.ndarray, bool, int]: (audio_chunk, is_finished, sample_rate)
+                - audio_chunk: Decoded audio waveform numpy array for this chunk
+                - is_finished: True if generation is complete
+                - sample_rate: Audio sample rate
+        """
+        # Prepare input embeddings (same logic as generate method)
+        talker_input_embeds, trailing_text_hiddens, tts_pad_embed = self._prepare_talker_inputs(
+            input_ids=input_ids,
+            instruct_ids=instruct_ids,
+            ref_ids=ref_ids,
+            voice_clone_prompt=voice_clone_prompt,
+            languages=languages,
+            speakers=speakers,
+            non_streaming_mode=non_streaming_mode,
+        )
+
+        # Get reference codes for voice cloning
+        ref_code = None
+        if voice_clone_prompt is not None:
+            ref_code_list = voice_clone_prompt.get("ref_code", None)
+            if ref_code_list is not None and ref_code_list[0] is not None:
+                ref_code = ref_code_list[0].to(self.talker.device)
+
+        # Create async decoding pipeline
+        with AsyncDecodingPipeline(
+            speech_tokenizer=self.speech_tokenizer,
+            ref_code=ref_code,
+            left_context_size=left_context_size,
+        ) as decode_pipeline:
+            # decode_pipeline.start() is called in __enter__
+
+            # Use streaming iterator to generate tokens
+            streaming_iter = self.talker.generate_streaming_iter(
+                inputs_embeds=talker_input_embeds,
+                attention_mask=torch.ones(
+                    (1, talker_input_embeds.shape[1]),
+                    device=talker_input_embeds.device,
+                    dtype=torch.long,
+                ),
+                trailing_text_hidden=trailing_text_hiddens,
+                tts_pad_embed=tts_pad_embed,
+                chunk_size=chunk_size,
+                max_new_tokens=max_new_tokens,
+                min_new_tokens=2,
+                do_sample=do_sample,
+                top_k=top_k,
+                top_p=top_p,
+                temperature=temperature,
+                subtalker_dosample=subtalker_dosample,
+                subtalker_top_k=subtalker_top_k,
+                subtalker_top_p=subtalker_top_p,
+                subtalker_temperature=subtalker_temperature,
+                eos_token_id=eos_token_id if eos_token_id is not None else self.config.talker_config.codec_eos_token_id,
+                repetition_penalty=repetition_penalty,
+                suppress_tokens=[
+                    i
+                    for i in range(self.config.talker_config.vocab_size - 1024, self.config.talker_config.vocab_size)
+                    if i not in (self.config.talker_config.codec_eos_token_id,)
+                ],
+            )
+
+            # Producer: generate chunks and submit for decoding
+            pending_chunks = 0
+
+            for chunk_output in streaming_iter:
+                # Submit chunk for async decoding
+                decode_pipeline.submit_chunk(
+                    chunk_output.codec_codes,
+                    is_last=chunk_output.is_finished,
+                )
+                pending_chunks += 1
+
+                # Consumer: yield decoded chunks as they become available
+                while pending_chunks > 0:
+                    audio, is_last, sr, error = decode_pipeline.get_decoded_chunk(timeout=0.01)
+                    if error is not None:
+                        raise error
+                    if audio is not None:
+                        pending_chunks -= 1
+                        yield audio, is_last, sr
+                        if is_last:
+                            return
+                    else:
+                        # No decoded chunk available yet, continue generating
+                        break
+
+            # Drain remaining decoded chunks
+            while pending_chunks > 0:
+                audio, is_last, sr, error = decode_pipeline.get_decoded_chunk(timeout=1.0)
+                if error is not None:
+                    raise error
+                if audio is not None:
+                    pending_chunks -= 1
+                    yield audio, is_last, sr
+
+    def _prepare_talker_inputs(
+        self,
+        input_ids: list[torch.Tensor],
+        instruct_ids: list[torch.Tensor] | None = None,
+        ref_ids: list[torch.Tensor] | None = None,
+        voice_clone_prompt: dict | None = None,
+        languages: list[str] | None = None,
+        speakers: list[str] | None = None,
+        non_streaming_mode: bool = False,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """
+        Prepare talker input embeddings for a single sample (batch size 1 for streaming).
+
+        Returns:
+            tuple: (talker_input_embeds, trailing_text_hiddens, tts_pad_embed)
+        """
+        # Only support single sample for streaming
+        assert len(input_ids) == 1, "Streaming only supports batch size 1"
+
+        input_id = input_ids[0]
+        language = languages[0] if languages else "auto"
+        speaker = speakers[0] if speakers else None
+
+        # Get special embeddings
+        tts_bos_embed, tts_eos_embed, tts_pad_embed = self.talker.text_projection(
+            self.talker.get_text_embeddings()(
+                torch.tensor(
+                    [[self.config.tts_bos_token_id, self.config.tts_eos_token_id, self.config.tts_pad_token_id]],
+                    device=self.talker.device,
+                    dtype=input_id.dtype,
+                )
+            )
+        ).chunk(3, dim=1)  # 3 * [1 1 d]
+
+        # Voice clone speaker prompt
+        voice_clone_spk_embeds = None
+        if voice_clone_prompt is not None:
+            voice_clone_spk_embeds = self.generate_speaker_prompt(voice_clone_prompt)
+
+        # Determine speaker embedding
+        if voice_clone_spk_embeds is None:
+            if speaker == "" or speaker is None:
+                speaker_embed = None
+            else:
+                if speaker.lower() not in self.config.talker_config.spk_id:
+                    raise NotImplementedError(f"Speaker {speaker} not implemented")
+                spk_id = self.config.talker_config.spk_id[speaker.lower()]
+                speaker_embed = self.talker.get_input_embeddings()(
+                    torch.tensor(spk_id, device=self.talker.device, dtype=input_id.dtype)
+                )
+        else:
+            if voice_clone_prompt["x_vector_only_mode"][0] or voice_clone_prompt["icl_mode"][0]:
+                speaker_embed = voice_clone_spk_embeds[0]
+            else:
+                speaker_embed = None
+
+        # Language ID
+        if language.lower() == "auto":
+            language_id = None
+        else:
+            if language.lower() not in self.config.talker_config.codec_language_id:
+                raise NotImplementedError(f"Language {language} not implemented")
+            language_id = self.config.talker_config.codec_language_id[language.lower()]
+
+        # Build codec prefill
+        if language_id is None:
+            codec_prefill_list = [
+                [
+                    self.config.talker_config.codec_nothink_id,
+                    self.config.talker_config.codec_think_bos_id,
+                    self.config.talker_config.codec_think_eos_id,
+                ]
+            ]
+        else:
+            codec_prefill_list = [
+                [
+                    self.config.talker_config.codec_think_id,
+                    self.config.talker_config.codec_think_bos_id,
+                    language_id,
+                    self.config.talker_config.codec_think_eos_id,
+                ]
+            ]
+
+        codec_input_emebdding_0 = self.talker.get_input_embeddings()(
+            torch.tensor(codec_prefill_list, device=self.talker.device, dtype=input_id.dtype)
+        )
+        codec_input_emebdding_1 = self.talker.get_input_embeddings()(
+            torch.tensor(
+                [[self.config.talker_config.codec_pad_id, self.config.talker_config.codec_bos_id]],
+                device=self.talker.device,
+                dtype=input_id.dtype,
+            )
+        )
+        if speaker_embed is None:
+            codec_input_emebdding = torch.cat([codec_input_emebdding_0, codec_input_emebdding_1], dim=1)
+        else:
+            codec_input_emebdding = torch.cat(
+                [codec_input_emebdding_0, speaker_embed.view(1, 1, -1), codec_input_emebdding_1], dim=1
+            )
+
+        # Build talker input embed
+        talker_input_embed_parts = []
+
+        # Instruct embed
+        if instruct_ids is not None and instruct_ids[0] is not None:
+            talker_input_embed_parts.append(
+                self.talker.text_projection(self.talker.get_text_embeddings()(instruct_ids[0]))
+            )
+
+        # Role embed: <|im_start|>assistant\n
+        _talker_input_embed_role = self.talker.text_projection(self.talker.get_text_embeddings()(input_id[:, :3]))
+
+        # tts_pad * N + tts_bos
+        _talker_input_embed = (
+            torch.cat(
+                (
+                    tts_pad_embed.expand(-1, codec_input_emebdding.shape[1] - 2, -1),
+                    tts_bos_embed,
+                ),
+                dim=1,
+            )
+            + codec_input_emebdding[:, :-1]
+        )
+
+        talker_input_embed = torch.cat((_talker_input_embed_role, _talker_input_embed), dim=1)
+
+        # Handle ICL mode or regular mode
+        if (
+            voice_clone_prompt is not None
+            and voice_clone_prompt["ref_code"] is not None
+            and voice_clone_prompt["icl_mode"][0]
+        ):
+            icl_input_embed, trailing_text_hidden = self.generate_icl_prompt(
+                text_id=input_id[:, 3:-5],
+                ref_id=ref_ids[0][:, 3:-2],
+                ref_code=voice_clone_prompt["ref_code"][0].to(self.talker.device),
+                tts_pad_embed=tts_pad_embed,
+                tts_eos_embed=tts_eos_embed,
+                non_streaming_mode=non_streaming_mode,
+            )
+            talker_input_embed = torch.cat([talker_input_embed, icl_input_embed], dim=1)
+        else:
+            # tts_text_first_token
+            talker_input_embed = torch.cat(
+                [
+                    talker_input_embed,
+                    self.talker.text_projection(self.talker.get_text_embeddings()(input_id[:, 3:4]))
+                    + codec_input_emebdding[:, -1:],
+                ],
+                dim=1,
+            )
+            if non_streaming_mode:
+                talker_input_embed = talker_input_embed[:, :-1]
+                talker_input_embed = torch.cat(
+                    [
+                        talker_input_embed,
+                        torch.cat(
+                            (
+                                self.talker.text_projection(self.talker.get_text_embeddings()(input_id[:, 3:-5])),
+                                tts_eos_embed,
+                            ),
+                            dim=1,
+                        )
+                        + self.talker.get_input_embeddings()(
+                            torch.tensor(
+                                [[self.config.talker_config.codec_pad_id] * (input_id[:, 3:-5].shape[1] + 1)],
+                                device=self.talker.device,
+                                dtype=input_id.dtype,
+                            )
+                        ),
+                        tts_pad_embed
+                        + self.talker.get_input_embeddings()(
+                            torch.tensor(
+                                [[self.config.talker_config.codec_bos_id]],
+                                device=self.talker.device,
+                                dtype=input_id.dtype,
+                            )
+                        ),
+                    ],
+                    dim=1,
+                )
+                trailing_text_hidden = tts_pad_embed
+            else:
+                trailing_text_hidden = torch.cat(
+                    (
+                        self.talker.text_projection(self.talker.get_text_embeddings()(input_id[:, 4:-5])),
+                        tts_eos_embed,
+                    ),
+                    dim=1,
+                )
+
+        # Prepend any additional parts
+        if talker_input_embed_parts:
+            talker_input_embed = torch.cat(talker_input_embed_parts + [talker_input_embed], dim=1)
+
+        return talker_input_embed, trailing_text_hidden, tts_pad_embed
+
+
+    @torch.no_grad()
+    def generate_streaming_legacy(
+        self,
+        input_ids: list[torch.Tensor] | None = None,
+        instruct_ids: list[torch.Tensor] | None = None,
+        ref_ids: list[torch.Tensor] | None = None,
+        voice_clone_prompt: list[dict] = None,
+        languages: list[str] = None,
+        speakers: list[str] = None,
+        non_streaming_mode=False,
+        max_new_tokens: int = 4096,
+        do_sample: bool = True,
+        top_k: int = 50,
+        top_p: float = 1.0,
+        temperature: float = 0.9,
+        subtalker_dosample: bool = True,
+        subtalker_top_k: int = 50,
+        subtalker_top_p: float = 1.0,
+        subtalker_temperature: float = 0.9,
+        eos_token_id: int | None = None,
+        repetition_penalty: float = 1.05,
+        chunk_size: int = 25,
+        left_context_size: int = 25,
+        **kwargs,
+    ):
+        """
+        Legacy streaming generation method (generates all tokens first, then streams audio).
+
+        Kept for backward compatibility. For true streaming, use generate_streaming().
+        """
+        # First, generate all talker codes (this is the same as regular generate)
+        talker_codes_list, _ = self.generate(
+            input_ids=input_ids,
+            instruct_ids=instruct_ids,
+            ref_ids=ref_ids,
+            voice_clone_prompt=voice_clone_prompt,
+            languages=languages,
+            speakers=speakers,
+            non_streaming_mode=non_streaming_mode,
+            max_new_tokens=max_new_tokens,
+            do_sample=do_sample,
+            top_k=top_k,
+            top_p=top_p,
+            temperature=temperature,
+            subtalker_dosample=subtalker_dosample,
+            subtalker_top_k=subtalker_top_k,
+            subtalker_top_p=subtalker_top_p,
+            subtalker_temperature=subtalker_temperature,
+            eos_token_id=eos_token_id,
+            repetition_penalty=repetition_penalty,
+            **kwargs,
+        )
+
+        # For each sample in the batch, decode and yield audio chunks
+        for sample_idx, talker_codes in enumerate(talker_codes_list):
+            # Get reference codes for voice cloning if applicable
+            ref_code = None
+            if voice_clone_prompt is not None:
+                ref_code_list = voice_clone_prompt.get("ref_code", None)
+                if ref_code_list is not None and ref_code_list[sample_idx] is not None:
+                    ref_code = ref_code_list[sample_idx].to(talker_codes.device)
+
+            # Prepend reference codes if available
+            if ref_code is not None:
+                full_codes = torch.cat([ref_code, talker_codes], dim=0)
+            else:
+                full_codes = talker_codes
+
+            # Decode in chunks
+            total_frames = full_codes.shape[0]
+            start_index = 0
+            chunk_idx = 0
+
+            while start_index < total_frames:
+                end_index = min(start_index + chunk_size, total_frames)
+
+                # Calculate context for smooth boundaries
+                if start_index == 0:
+                    context_size = 0
+                else:
+                    context_size = min(left_context_size, start_index)
+
+                # Extract chunk with context
+                codes_chunk = full_codes[start_index - context_size : end_index]
+
+                # Decode the chunk
+                # codes_chunk shape: [T, Q] -> [1, T, Q]
+                # model.decode expects [B, T, K] and internally transposes to [B, K, T]
+                codes_for_decode = codes_chunk.unsqueeze(0)
+
+                # Decode using speech tokenizer
+                wavs, sr = self.speech_tokenizer.decode({"audio_codes": codes_for_decode})
+                audio_chunk = wavs[0]
+
+                # Remove context portion from the output
+                if context_size > 0:
+                    upsample_rate = getattr(self.speech_tokenizer.model, "decode_upsample_rate", 2000)
+                    context_samples = context_size * upsample_rate
+                    if context_samples < len(audio_chunk):
+                        audio_chunk = audio_chunk[context_samples:]
+
+                is_finished = end_index >= total_frames
+
+                yield audio_chunk, is_finished, sr
+
+                start_index = end_index
+                chunk_idx += 1
+
+    def generate_streaming_to_list(
+        self,
+        input_ids: list[torch.Tensor] | None = None,
+        instruct_ids: list[torch.Tensor] | None = None,
+        ref_ids: list[torch.Tensor] | None = None,
+        voice_clone_prompt: list[dict] = None,
+        languages: list[str] = None,
+        speakers: list[str] = None,
+        non_streaming_mode=False,
+        max_new_tokens: int = 4096,
+        do_sample: bool = True,
+        top_k: int = 50,
+        top_p: float = 1.0,
+        temperature: float = 0.9,
+        subtalker_dosample: bool = True,
+        subtalker_top_k: int = 50,
+        subtalker_top_p: float = 1.0,
+        subtalker_temperature: float = 0.9,
+        eos_token_id: int | None = None,
+        repetition_penalty: float = 1.05,
+        chunk_size: int = 25,
+        left_context_size: int = 25,
+        **kwargs,
+    ) -> tuple[list, int]:
+        """
+        Convenience method that collects all streaming chunks into a list.
+
+        Useful for testing or when you want to process all chunks after generation.
+
+        Returns:
+            tuple: (list of audio chunks, sample_rate)
+        """
+        chunks = []
+        sample_rate = None
+
+        for audio_chunk, is_finished, sr in self.generate_streaming(
+            input_ids=input_ids,
+            instruct_ids=instruct_ids,
+            ref_ids=ref_ids,
+            voice_clone_prompt=voice_clone_prompt,
+            languages=languages,
+            speakers=speakers,
+            non_streaming_mode=non_streaming_mode,
+            max_new_tokens=max_new_tokens,
+            do_sample=do_sample,
+            top_k=top_k,
+            top_p=top_p,
+            temperature=temperature,
+            subtalker_dosample=subtalker_dosample,
+            subtalker_top_k=subtalker_top_k,
+            subtalker_top_p=subtalker_top_p,
+            subtalker_temperature=subtalker_temperature,
+            eos_token_id=eos_token_id,
+            repetition_penalty=repetition_penalty,
+            chunk_size=chunk_size,
+            left_context_size=left_context_size,
+            **kwargs,
+        ):
+            chunks.append(audio_chunk)
+            sample_rate = sr
+
+        return chunks, sample_rate
+
 
 __all__ = [
     "Qwen3TTSForConditionalGeneration",
     "Qwen3TTSTalkerForConditionalGeneration",
     "Qwen3TTSPreTrainedModel",
     "Qwen3TTSTalkerModel",
+    "StreamingChunkOutput",
+    "AsyncDecodingPipeline",
 ]
