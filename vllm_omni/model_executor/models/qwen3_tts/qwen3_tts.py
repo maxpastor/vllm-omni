@@ -15,6 +15,7 @@
 import base64
 import io
 import urllib.request
+import uuid
 from collections.abc import Generator, Iterable
 from dataclasses import dataclass
 from typing import Any
@@ -224,7 +225,7 @@ class Qwen3TTSModelForGeneration(nn.Module):
         Returns:
             OmniOutput: Contains audio chunk and streaming status
         """
-        request_id = kwargs.get("request_id", "default")
+        request_id = kwargs.get("request_id") or str(uuid.uuid4())
 
         # Initialize streaming state if not exists
         if request_id not in self._streaming_state:
@@ -273,41 +274,13 @@ class Qwen3TTSModelForGeneration(nn.Module):
 
             self._streaming_state[request_id] = {
                 "generator": generator,
-                "audio_chunks": [],
-                "is_finished": False,
-                "sample_rate": None,
             }
 
         state = self._streaming_state[request_id]
-        # If already finished, return final output
-        if state["is_finished"]:
-            # Clean up state and return accumulated audio
-            audio_chunks = state["audio_chunks"]
-            sr = state["sample_rate"]
-            del self._streaming_state[request_id]
-
-            if audio_chunks:
-                full_audio = np.concatenate(audio_chunks)
-                # Use .clone().contiguous() to ensure safe serialization (avoid stride-0 issues)
-                audio_tensor = torch.from_numpy(full_audio).float().clone().contiguous()
-                return OmniOutput(
-                    text_hidden_states=None,
-                    multimodal_outputs={
-                        "model_outputs": audio_tensor,
-                        "sr": torch.tensor(sr, dtype=torch.int),
-                        "finished": torch.tensor(True),
-                    },
-                )
-            return OmniOutput(text_hidden_states=None, multimodal_outputs={"finished": torch.tensor(True)})
 
         # Get next chunk from generator
         try:
             audio_chunk, is_finished, sr = next(state["generator"])
-            state["audio_chunks"].append(
-                audio_chunk if isinstance(audio_chunk, np.ndarray) else audio_chunk.cpu().numpy()
-            )
-            state["sample_rate"] = sr
-            state["is_finished"] = is_finished
 
             # Convert chunk to tensor
             # Use .clone().contiguous() to ensure safe serialization (avoid stride-0 issues)
@@ -1305,6 +1278,8 @@ class Qwen3TTSModel:
             )
 
         texts = self._ensure_list(text)
+        if len(texts) > 1:
+            raise ValueError("Streaming generation only supports batch size 1")
         languages = (
             self._ensure_list(language)
             if isinstance(language, list)
@@ -1395,6 +1370,8 @@ class Qwen3TTSModel:
             )
 
         texts = self._ensure_list(text)
+        if len(texts) > 1:
+            raise ValueError("Streaming generation only supports batch size 1")
         languages = (
             self._ensure_list(language)
             if isinstance(language, list)
@@ -1477,6 +1454,8 @@ class Qwen3TTSModel:
             )
 
         texts = self._ensure_list(text)
+        if len(texts) > 1:
+            raise ValueError("Streaming generation only supports batch size 1")
         languages = (
             self._ensure_list(language)
             if isinstance(language, list)

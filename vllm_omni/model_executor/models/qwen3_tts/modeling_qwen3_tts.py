@@ -398,9 +398,9 @@ def mel_spectrogram(
         torch.Tensor: Mel spectrogram.
     """
     if torch.min(y) < -1.0:
-        print(f"[WARNING] Min value of input waveform signal is {torch.min(y)}")
+        logger.warning("Min value of input waveform signal is %s", torch.min(y))
     if torch.max(y) > 1.0:
-        print(f"[WARNING] Max value of input waveform signal is {torch.max(y)}")
+        logger.warning("Max value of input waveform signal is %s", torch.max(y))
 
     device = y.device
 

@@ -373,9 +373,6 @@ class OmniGenerationScheduler(VLLMScheduler):
                 and pooler_finished
             ):
                 request.status = RequestStatus.FINISHED_STOPPED
-                # Optional: set a stop_reason for front-end clarity
-                # (does not affect protocol)
-                request.stop_reason = request.stop_reason  # or "generation_done"
                 stopped = True
 
             if stopped:
