@@ -1,3 +1,4 @@
+from ast import Dict
 from collections.abc import Callable
 from typing import Any
 
@@ -36,9 +37,8 @@ class OmniRequestState(RequestState):
         **kwargs,
     ):
         super().__init__(*args, **kwargs)
-        # Omni-specific: multimodal output accumulation
         self.mm_type: str | None = None
-        self.mm_accumulated: dict[str, Any] | None = None
+        self.mm_accumulated: Dict[str, Any] | None = None
 
     def add_multimodal_tensor(self, payload: Any | None, mm_type: str | None) -> None:
         if payload is None:
@@ -57,7 +57,7 @@ class OmniRequestState(RequestState):
                 return x
 
             if isinstance(payload, dict):
-                incoming: dict[str, Any] = {}
+                incoming: Dict[str, Any] = {}
                 target_key = self.mm_type or "hidden"
 
                 # Iterate directly without unnecessary dict copy
@@ -178,7 +178,17 @@ class OmniRequestState(RequestState):
         finished = finish_reason is not None
         final_only = self.output_kind == RequestOutputKind.FINAL_ONLY
 
-        if not finished and final_only:
+        # For streaming multimodal models (e.g., TTS producing audio chunks),
+        # emit intermediate outputs even in FINAL_ONLY mode when the model
+        # has accumulated multimodal data with a streaming "finished" flag.
+        has_streaming_mm_output = (
+            not finished
+            and self.mm_accumulated is not None
+            and isinstance(self.mm_accumulated, dict)
+            and "finished" in self.mm_accumulated
+        )
+
+        if not finished and final_only and not has_streaming_mm_output:
             return None
 
         # Consolidate accumulated tensors when finishing.
@@ -205,18 +215,17 @@ class OmniRequestState(RequestState):
                 new_token_ids = self.detokenizer.output_token_ids[self.sent_tokens_offset :]
                 self.sent_tokens_offset = len(self.detokenizer.output_token_ids)
 
-        external_req_id = self.external_req_id
+        request_id = self.request_id
         output = self._new_completion_output(new_token_ids, finish_reason, stop_reason, routed_experts)
 
         if self.parent_req is None:
             outputs = [output]
         else:
-            outputs, finished = self.parent_req.get_outputs(self.request_id, output)
+            request_id, outputs, finished = self.parent_req.get_outputs(request_id, output)
             if not outputs:
                 return None
-            external_req_id = self.parent_req.external_req_id
 
-        return self._new_request_output(external_req_id, outputs, finished, kv_transfer_params)
+        return self._new_request_output(request_id, outputs, finished, kv_transfer_params)
 
     def _new_completion_output(
         self,
@@ -238,6 +247,13 @@ class OmniRequestState(RequestState):
                         mm_out[k] = v
                 else:
                     setattr(base_output, "multimodal_output", self.mm_accumulated)
+
+                # For streaming multimodal outputs (e.g., TTS audio chunks),
+                # reset accumulated data after attaching to avoid re-sending
+                # previous chunks in subsequent intermediate outputs.
+                is_streaming = isinstance(self.mm_accumulated, dict) and "finished" in self.mm_accumulated
+                if is_streaming and finish_reason is None:
+                    self.mm_accumulated = None
         except Exception:
             logger.exception("Error in _new_completion_output")
         return base_output
@@ -258,9 +274,8 @@ class MultimodalOutputProcessor(VLLMOutputProcessor):
 
     def __init__(
         self,
-        tokenizer: TokenizerLike | None,
+        tokenizer: TokenizerLike,
         log_stats: bool,
-        stream_interval: int = 1,
         engine_core_output_type: str | None = None,
     ):
         """Initialize the multimodal output processor.
@@ -268,12 +283,11 @@ class MultimodalOutputProcessor(VLLMOutputProcessor):
         Args:
             tokenizer: Tokenizer for detokenizing text outputs
             log_stats: Whether to log statistics
-            stream_interval: Stream interval for output generation
             engine_core_output_type: Optional output type specification
                 (e.g., "image", "audio", "latents"). Used to route outputs
                 to appropriate processors. If None, output type is inferred.
         """
-        super().__init__(tokenizer=tokenizer, log_stats=log_stats, stream_interval=stream_interval)
+        super().__init__(tokenizer=tokenizer, log_stats=log_stats)
         self.output_handlers: dict[str, Callable[[EngineCoreOutput], None]] = {}
         self._reqid_to_mm_type: dict[str, str] = {}
         self.engine_core_output_type = engine_core_output_type

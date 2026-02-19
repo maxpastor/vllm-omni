@@ -1,3 +1,6 @@
+import queue
+import threading
+from collections.abc import Iterator
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -128,10 +131,9 @@ class OmniRequestOutput:
         For diffusion outputs, this returns the local _multimodal_output field.
         """
         if self.request_output is not None:
-            # Check completion outputs first (where multimodal_output is attached).
-            outputs = getattr(self.request_output, "outputs", None)
-            if isinstance(outputs, list) and outputs:
-                for output in outputs:
+            # Check completion outputs first (where multimodal_output is attached)
+            if self.request_output.outputs:
+                for output in self.request_output.outputs:
                     mm = getattr(output, "multimodal_output", None)
                     if mm:
                         return mm
@@ -251,3 +253,164 @@ class OmniRequestOutput:
         ]
 
         return f"OmniRequestOutput({', '.join(parts)})"
+
+
+@dataclass
+class StreamingChunkOutput:
+    """Output for each streaming chunk during TTS generation."""
+
+    codec_codes: torch.Tensor  # [chunk_size, num_quantizers] codec tokens for this chunk
+    hidden_states: torch.Tensor | None = None  # corresponding hidden states
+    chunk_idx: int = 0  # chunk index
+    is_finished: bool = False  # whether generation is complete
+    total_generated: int = 0  # total tokens generated so far
+
+
+class AsyncDecodingPipeline:
+    """
+    Asynchronous decoding pipeline that runs audio decoding in a background thread
+    while generation continues in the main thread.
+    """
+
+    def __init__(
+        self,
+        speech_tokenizer,
+        ref_code: torch.Tensor | None = None,
+        left_context_size: int = 25,
+        max_queue_size: int = 10,
+    ):
+        self.speech_tokenizer = speech_tokenizer
+        self.ref_code = ref_code
+        self.left_context_size = left_context_size
+
+        # Queue for codec chunks to be decoded
+        # Each item is (codes_with_context, is_last, context_frames_to_remove)
+        self._input_queue: queue.Queue = queue.Queue(maxsize=max_queue_size)
+        # Queue for decoded audio chunks
+        self._output_queue: queue.Queue = queue.Queue()
+
+        self._decode_thread: threading.Thread | None = None
+        self._stop_event = threading.Event()
+        self._started = False
+        self._all_codes: list[torch.Tensor] = []
+        self._sample_rate: int | None = None
+
+    def start(self):
+        """Start the background decoding thread."""
+        if self._started:
+            return
+        self._stop_event.clear()
+        self._decode_thread = threading.Thread(target=self._decode_worker, daemon=True)
+        self._decode_thread.start()
+        self._started = True
+
+    def _decode_worker(self):
+        """Background worker that decodes codec chunks to audio."""
+        chunk_idx = 0
+
+        while not self._stop_event.is_set():
+            try:
+                item = self._input_queue.get(timeout=0.1)
+            except queue.Empty:
+                continue
+
+            if item is None:  # Sentinel to stop
+                break
+
+            codes_chunk, is_last, context_frames = item
+
+            # Decode the chunk
+            try:
+                # codes shape: [seq_len, num_quantizers] -> [1, seq_len, num_quantizers]
+                # model.decode expects [B, T, K] and internally transposes to [B, K, T]
+                codes_for_decode = codes_chunk.unsqueeze(0)
+                wavs, sr = self.speech_tokenizer.decode({"audio_codes": codes_for_decode})
+                audio_chunk = wavs[0]  # numpy array
+                self._sample_rate = sr
+
+                # Remove context samples from the beginning of the audio
+                if context_frames > 0:
+                    upsample_rate = getattr(self.speech_tokenizer.model, "decode_upsample_rate", 2000)
+                    context_samples = context_frames * upsample_rate
+                    if context_samples < len(audio_chunk):
+                        audio_chunk = audio_chunk[context_samples:]
+
+                self._output_queue.put((audio_chunk, is_last, sr, None))
+            except Exception as e:
+                self._output_queue.put((None, is_last, None, e))
+
+            chunk_idx += 1
+
+    def submit_chunk(self, codec_codes: torch.Tensor, is_last: bool = False):
+        """Submit a chunk of codec codes for decoding."""
+        self._all_codes.append(codec_codes)
+
+        # Prepare chunk with context and track how many context frames were added
+        context_frames = 0
+
+        if len(self._all_codes) == 1:
+            # First chunk - prepend ref_code if available
+            if self.ref_code is not None:
+                codes_with_context = torch.cat([self.ref_code, codec_codes], dim=0)
+                context_frames = self.ref_code.shape[0]
+            else:
+                codes_with_context = codec_codes
+                context_frames = 0
+        else:
+            # Subsequent chunks - add left context from previously generated codes
+            context_codes = torch.cat(self._all_codes[:-1], dim=0)
+            context_frames = min(self.left_context_size, context_codes.shape[0])
+            context_start = context_codes.shape[0] - context_frames
+            context = context_codes[context_start:]
+            codes_with_context = torch.cat([context, codec_codes], dim=0)
+
+        self._input_queue.put((codes_with_context, is_last, context_frames))
+
+        # Limit memory usage: only keep enough codes for left_context_size
+        # Merge old codes if we have too many chunks
+        if len(self._all_codes) > 10:
+            # Merge all codes and keep only the last left_context_size frames
+            all_merged = torch.cat(self._all_codes, dim=0)
+            if all_merged.shape[0] > self.left_context_size:
+                self._all_codes = [all_merged[-self.left_context_size :]]
+            else:
+                self._all_codes = [all_merged]
+
+    def get_decoded_chunk(self, timeout: float | None = None) -> tuple[Any, bool, int | None, Exception | None]:
+        """
+        Get the next decoded audio chunk.
+
+        Returns:
+            tuple: (audio_chunk, is_last, sample_rate, error)
+        """
+        try:
+            return self._output_queue.get(timeout=timeout)
+        except queue.Empty:
+            return None, False, None, None
+
+    def iter_decoded_chunks(self) -> Iterator[tuple[Any, bool, int]]:
+        """Iterate over decoded audio chunks as they become available."""
+        while True:
+            audio, is_last, sr, error = self.get_decoded_chunk(timeout=1.0)
+            if error is not None:
+                raise error
+            if audio is not None:
+                yield audio, is_last, sr
+            if is_last:
+                break
+
+    def stop(self):
+        """Stop the decoding pipeline."""
+        self._stop_event.set()
+        self._input_queue.put(None)  # Sentinel
+        if self._decode_thread is not None:
+            self._decode_thread.join(timeout=2.0)
+        self._started = False
+
+    def __enter__(self):
+        self.start()
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        self.stop()
+        return False
