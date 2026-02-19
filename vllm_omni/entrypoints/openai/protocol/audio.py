@@ -81,10 +81,10 @@ class StreamingSpeechSessionConfig(BaseModel):
     voice: str | None = None
     task_type: Literal["CustomVoice", "VoiceDesign", "Base"] | None = None
     language: str | None = None
-    instructions: str | None = None
+    instructions: str | None = Field(default=None, max_length=500)
     response_format: Literal["wav", "pcm", "flac", "mp3", "aac", "opus"] = "wav"
     speed: float | None = Field(default=1.0, ge=0.25, le=4.0)
-    max_new_tokens: int | None = None
+    max_new_tokens: int | None = Field(default=None, ge=1, le=4096)
     ref_audio: str | None = None
     ref_text: str | None = None
     x_vector_only_mode: bool | None = None

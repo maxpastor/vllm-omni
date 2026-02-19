@@ -860,7 +860,17 @@ async def streaming_speech(websocket: WebSocket):
 
     Accepts text incrementally, splits at sentence boundaries, and
     returns audio per sentence. See serving_speech_stream.py for protocol.
+
+    Gated by QWEN3_TTS_STREAMING_ENABLED env var (defaults to "1").
     """
+    if os.environ.get("QWEN3_TTS_STREAMING_ENABLED", "1") != "1":
+        await websocket.accept()
+        await websocket.send_json(
+            {"type": "error", "message": "Streaming speech is disabled"}
+        )
+        await websocket.close()
+        return
+
     handler = getattr(websocket.app.state, "openai_streaming_speech", None)
     if handler is None:
         await websocket.accept()

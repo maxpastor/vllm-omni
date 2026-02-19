@@ -10,9 +10,12 @@ import re
 # - English: .!? followed by whitespace or end of string
 # - CJK fullwidth: 。！？，；
 _SENTENCE_BOUNDARY_RE = re.compile(
-    r"(?<=[.!?])\s+"  # English punctuation followed by whitespace
+    r"(?<=[.!?])(?:\s+|$)"  # English punctuation followed by whitespace or end
     r"|(?<=[。！？，；])"  # CJK fullwidth punctuation
 )
+
+# Default max buffer size to prevent unbounded memory growth
+_DEFAULT_MAX_BUFFER_SIZE = 100_000
 
 
 class SentenceSplitter:
@@ -27,9 +30,14 @@ class SentenceSplitter:
             splitting on abbreviations like "Dr." or "U.S.".
     """
 
-    def __init__(self, min_sentence_length: int = 2) -> None:
+    def __init__(
+        self,
+        min_sentence_length: int = 2,
+        max_buffer_size: int = _DEFAULT_MAX_BUFFER_SIZE,
+    ) -> None:
         self._buffer: str = ""
         self._min_sentence_length = min_sentence_length
+        self._max_buffer_size = max_buffer_size
 
     @property
     def buffer(self) -> str:
@@ -50,6 +58,14 @@ class SentenceSplitter:
             return []
 
         self._buffer += text
+
+        # Guard against unbounded buffer growth
+        if len(self._buffer) > self._max_buffer_size:
+            # Force-flush the entire buffer as one sentence
+            sentence = self._buffer.strip()
+            self._buffer = ""
+            return [sentence] if sentence else []
+
         return self._extract_sentences()
 
     def flush(self) -> str | None:

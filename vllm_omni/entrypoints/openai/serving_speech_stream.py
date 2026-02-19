@@ -161,6 +161,18 @@ class OmniStreamingSpeechHandler:
             await self._send_error(websocket, f"Invalid session config: {e}")
             return None
 
+        # Validate model name against served models if provided
+        if config.model:
+            error_check = await self._speech_service._check_model(
+                OpenAICreateSpeechRequest(input="", model=config.model)
+            )
+            if error_check is not None:
+                await self._send_error(
+                    websocket,
+                    f"Invalid model: {config.model}",
+                )
+                return None
+
         return config
 
     async def _generate_and_send(
