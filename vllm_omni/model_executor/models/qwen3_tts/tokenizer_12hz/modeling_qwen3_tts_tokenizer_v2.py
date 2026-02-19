@@ -855,7 +855,7 @@ class Qwen3TTSTokenizerV2Decoder(Qwen3TTSTokenizerV2DecoderPreTrainedModel):
         hidden = self.quantizer.decode(codes)
         hidden = self.pre_conv(hidden).transpose(1, 2)
 
-        hidden = self.pre_transformer(inputs_embeds=hidden).last_hidden_state
+        hidden = self.pre_transformer(inputs_embeds=hidden, use_cache=False).last_hidden_state
         hidden = hidden.permute(0, 2, 1)
         for blocks in self.upsample:
             for block in blocks:
@@ -865,7 +865,44 @@ class Qwen3TTSTokenizerV2Decoder(Qwen3TTSTokenizerV2DecoderPreTrainedModel):
             wav = block(wav)
         return wav.clamp(min=-1, max=1)
 
-    def chunked_decode(self, codes, chunk_size=300, left_context_size=25):
+    def chunked_decode(self, codes: torch.Tensor, chunk_size: int = 300, left_context_size: int = 25) -> torch.Tensor:
+        """
+        Decode codec tokens to audio waveform in chunks.
+
+        Args:
+            codes: Codec tokens, shape [B, num_quantizers, T]
+            chunk_size: Number of frames per chunk
+            left_context_size: Context frames from previous chunk
+
+        Returns:
+            torch.Tensor: Decoded audio waveform
+        """
+        # Filter out invalid frames: decoder codebook only has `codebook_size` entries
+        # Any token >= codebook_size (including EOS tokens) should be truncated
+        codec_valid_max = self.config.codebook_size
+
+        # Check if any layer has invalid token at each time step
+        invalid_mask = (codes >= codec_valid_max).any(dim=1)  # [B, T]
+
+        # Truncate at first invalid position
+        if invalid_mask.any():
+            batch_size = codes.shape[0]
+            if batch_size != 1:
+                raise ValueError(
+                    f"chunked_decode only supports batch size 1 when invalid codec tokens "
+                    f"(token >= codebook_size={codec_valid_max}) are present. "
+                    f"Got batch size {batch_size}."
+                )
+            for b in range(codes.shape[0]):
+                if invalid_mask[b].any():
+                    first_invalid = invalid_mask[b].nonzero(as_tuple=True)[0][0].item()
+                    codes = codes[:, :, :first_invalid]
+                    break  # Assuming batch size 1 for now
+
+        if codes.shape[-1] == 0:
+            # All tokens were invalid, return empty audio
+            return torch.zeros((codes.shape[0], 1, 0), device=codes.device)
+
         wavs = []
         start_index = 0
         while start_index < codes.shape[-1]:
