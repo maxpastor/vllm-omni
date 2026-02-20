@@ -12,23 +12,47 @@ from vllm_omni.plugins import load_omni_general_plugins
 logger = init_logger(__name__)
 
 
-def _with_architecture_override(hf_overrides: Any, model_arch: str) -> Any:
+def _normalize_model_arch(model_stage: str | None, model_arch: str) -> str:
+    """Normalize architecture for known stage names."""
+    stage_to_arch = {
+        "qwen3_tts": "Qwen3TTSForConditionalGeneration",
+    }
+    expected = stage_to_arch.get((model_stage or "").lower())
+    if expected is None:
+        return model_arch
+    if model_arch != expected:
+        logger.info("Overriding model_arch %s -> %s for model_stage=%s", model_arch, expected, model_stage)
+    return expected
+
+
+def _with_architecture_override(hf_overrides: Any, model_arch: str, model_stage: str | None) -> Any:
     """Force HF config architecture to match stage-selected omni model arch."""
     arch_override = [model_arch]
+    stage_lower = (model_stage or "").lower()
+
+    def _apply_stage_overrides(container: Any) -> Any:
+        if isinstance(container, dict):
+            if stage_lower == "qwen3_tts":
+                container["model_type"] = "qwen3_tts"
+            container["architectures"] = arch_override
+        else:
+            if stage_lower == "qwen3_tts":
+                setattr(container, "model_type", "qwen3_tts")
+            setattr(container, "architectures", arch_override)
+        return container
+
     if hf_overrides is None:
-        return {"architectures": arch_override}
+        return _apply_stage_overrides({})
 
     if isinstance(hf_overrides, dict):
         merged = dict(hf_overrides)
-        merged["architectures"] = arch_override
-        return merged
+        return _apply_stage_overrides(merged)
 
     if callable(hf_overrides):
         def _combined_override(cfg: Any) -> Any:
             updated_cfg = hf_overrides(cfg)
             target_cfg = cfg if updated_cfg is None else updated_cfg
-            setattr(target_cfg, "architectures", arch_override)
-            return target_cfg
+            return _apply_stage_overrides(target_cfg)
 
         return _combined_override
 
@@ -135,6 +159,7 @@ class OmniEngineArgs(EngineArgs):
 
         # register omni models to avoid model not found error
         self._ensure_omni_models_registered()
+        self.model_arch = _normalize_model_arch(self.model_stage, self.model_arch)
 
         # Keep compatibility when async args are constructed from partial payloads.
         limit_mm_per_prompt = getattr(self, "limit_mm_per_prompt", {})
@@ -159,7 +184,9 @@ class OmniEngineArgs(EngineArgs):
         stage_connector_config["extra"]["stage_id"] = self.stage_id
 
         # Ensure architecture override is applied before ModelConfig init.
-        hf_overrides = _with_architecture_override(self.hf_overrides, self.model_arch)
+        hf_overrides = _with_architecture_override(
+            self.hf_overrides, self.model_arch, self.model_stage
+        )
 
         # Create OmniModelConfig directly from engine args
         # Note: We pass the actual init parameters matching vLLM's EngineArgs.create_model_config()
@@ -294,6 +321,7 @@ class AsyncOmniEngineArgs(AsyncEngineArgs):
 
         # register omni models to avoid model not found error
         self._ensure_omni_models_registered()
+        self.model_arch = _normalize_model_arch(self.model_stage, self.model_arch)
 
         # Keep compatibility when async args are constructed from partial payloads.
         limit_mm_per_prompt = getattr(self, "limit_mm_per_prompt", {})
@@ -318,7 +346,9 @@ class AsyncOmniEngineArgs(AsyncEngineArgs):
         stage_connector_config["extra"]["stage_id"] = self.stage_id
 
         # Ensure architecture override is applied before ModelConfig init.
-        hf_overrides = _with_architecture_override(self.hf_overrides, self.model_arch)
+        hf_overrides = _with_architecture_override(
+            self.hf_overrides, self.model_arch, self.model_stage
+        )
 
         # Create OmniModelConfig directly from engine args
         # Note: We pass the actual init parameters matching vLLM's EngineArgs.create_model_config()

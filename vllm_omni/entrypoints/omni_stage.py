@@ -1119,6 +1119,12 @@ async def _stage_worker_async(
             )
             vllm_config = None  # Diffusion doesn't use vllm_config
         else:
+            logger.info(
+                "[Stage-%s] Async engine bootstrap model_stage=%s model_arch=%s",
+                stage_id,
+                engine_args.get("model_stage"),
+                engine_args.get("model_arch"),
+            )
             omni_engine_args = AsyncOmniEngineArgs(model=model, **engine_args)
             usage_context = UsageContext.OPENAI_API_SERVER
             vllm_config = omni_engine_args.create_engine_config(usage_context=usage_context)
