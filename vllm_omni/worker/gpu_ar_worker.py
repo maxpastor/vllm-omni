@@ -4,13 +4,20 @@ import os
 import torch
 from vllm.logger import init_logger
 from vllm.platforms import current_platform
-from vllm.tracing import instrument
 from vllm.utils.mem_utils import MemorySnapshot, format_gib
 from vllm.utils.torch_utils import set_random_seed
 from vllm.v1.utils import report_usage_stats
 from vllm.v1.worker.gpu_worker import init_worker_distributed_environment
 from vllm.v1.worker.utils import request_memory
 from vllm.v1.worker.workspace import init_workspace_manager
+try:
+    from vllm.tracing import instrument
+except Exception:
+    def instrument(*args, **kwargs):
+        def _decorator(func):
+            return func
+
+        return _decorator
 
 from vllm_omni.worker.base import OmniGPUWorkerBase
 from vllm_omni.worker.gpu_ar_model_runner import GPUARModelRunner
