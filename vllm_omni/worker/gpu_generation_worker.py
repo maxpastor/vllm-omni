@@ -27,10 +27,11 @@ logger = init_logger(__name__)
 
 
 def _register_qwen3_tts_hf_components() -> None:
-    """Register Qwen3-TTS HF auto classes in worker subprocesses."""
+    """Register Qwen3-TTS HF + omni model classes in worker subprocesses."""
     try:
         from transformers import AutoConfig, AutoModel, AutoProcessor
 
+        from vllm_omni.engine.arg_utils import register_omni_models_to_vllm
         from vllm_omni.model_executor.models.qwen3_tts.configuration_qwen3_tts import (
             Qwen3TTSConfig,
         )
@@ -41,6 +42,11 @@ def _register_qwen3_tts_hf_components() -> None:
     except Exception as exc:
         logger.warning("Skipping Qwen3-TTS HF auto registration in generation worker: %s", exc)
         return
+
+    try:
+        register_omni_models_to_vllm()
+    except Exception as exc:
+        logger.warning("Skipping omni model registry registration in generation worker: %s", exc)
 
     try:
         AutoConfig.register("qwen3_tts", Qwen3TTSConfig)
