@@ -62,26 +62,42 @@ class OmniModelConfig(ModelConfig):
     def registry(self):
         return me_models.OmniModelRegistry
 
+    def _qwen3_tts_signal(self) -> str | None:
+        stage = (self.model_stage or "").lower()
+        if stage == "qwen3_tts":
+            return "model_stage"
+
+        if self.model_arch == "Qwen3TTSForConditionalGeneration":
+            return "model_arch"
+
+        hf_cfg = getattr(self, "hf_config", None)
+        hf_model_type = getattr(hf_cfg, "model_type", None)
+        if hf_model_type == "qwen3_tts":
+            return "hf_config.model_type"
+
+        return None
+
     @property
     def architectures(self) -> list[str]:
-        if self.model_stage == "qwen3_tts":
+        if self._qwen3_tts_signal() is not None:
             return ["Qwen3TTSForConditionalGeneration"]
         return [self.model_arch]
 
     def get_model_arch_config(self):
         arch_config = super().get_model_arch_config()
-        if self.model_stage == "qwen3_tts":
+        qwen3_signal = self._qwen3_tts_signal()
+        if qwen3_signal is not None:
             forced_architectures = ["Qwen3TTSForConditionalGeneration"]
-        else:
-            forced_architectures = [self.model_arch]
-        if arch_config.architectures != forced_architectures:
-            logger.info(
-                "Forcing model architectures %s -> %s for model_stage=%s",
-                arch_config.architectures,
-                forced_architectures,
-                self.model_stage,
-            )
-            arch_config.architectures = forced_architectures
+            if arch_config.architectures != forced_architectures:
+                logger.info(
+                    "Forcing model architectures %s -> %s (signal=%s, model_stage=%s, model_arch=%s)",
+                    arch_config.architectures,
+                    forced_architectures,
+                    qwen3_signal,
+                    self.model_stage,
+                    self.model_arch,
+                )
+                arch_config.architectures = forced_architectures
         return arch_config
 
     @property
