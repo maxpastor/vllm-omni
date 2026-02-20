@@ -70,7 +70,10 @@ class OmniModelConfig(ModelConfig):
 
     def get_model_arch_config(self):
         arch_config = super().get_model_arch_config()
-        forced_architectures = self.architectures
+        if self.model_stage == "qwen3_tts":
+            forced_architectures = ["Qwen3TTSForConditionalGeneration"]
+        else:
+            forced_architectures = [self.model_arch]
         if arch_config.architectures != forced_architectures:
             logger.info(
                 "Forcing model architectures %s -> %s for model_stage=%s",
