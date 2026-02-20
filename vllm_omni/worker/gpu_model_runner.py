@@ -41,6 +41,44 @@ else:
 logger = init_logger(__name__)
 
 
+def _register_qwen3_tts_hf_components() -> None:
+    """Register Qwen3-TTS HF auto classes in worker subprocesses.
+
+    Worker processes may initialize multimodal processors before omni
+    engine-arg registration hooks run. Ensure AutoConfig/AutoModel/
+    AutoProcessor know about `qwen3_tts` in this process.
+    """
+    try:
+        from transformers import AutoConfig, AutoModel, AutoProcessor
+
+        from vllm_omni.model_executor.models.qwen3_tts.configuration_qwen3_tts import (
+            Qwen3TTSConfig,
+        )
+        from vllm_omni.model_executor.models.qwen3_tts.modeling_qwen3_tts import (
+            Qwen3TTSForConditionalGeneration,
+        )
+        from vllm_omni.model_executor.models.qwen3_tts.processing_qwen3_tts import Qwen3TTSProcessor
+    except Exception as exc:
+        logger.warning("Skipping Qwen3-TTS HF auto registration in worker: %s", exc)
+        return
+
+    try:
+        AutoConfig.register("qwen3_tts", Qwen3TTSConfig)
+    except ValueError:
+        pass
+    try:
+        AutoModel.register(Qwen3TTSConfig, Qwen3TTSForConditionalGeneration)
+    except ValueError:
+        pass
+    try:
+        AutoProcessor.register(Qwen3TTSConfig, Qwen3TTSProcessor)
+    except ValueError:
+        pass
+
+
+_register_qwen3_tts_hf_components()
+
+
 class OmniGPUModelRunner(GPUModelRunner):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
