@@ -64,6 +64,8 @@ class OmniModelConfig(ModelConfig):
 
     @property
     def architectures(self) -> list[str]:
+        if self.model_stage == "qwen3_tts":
+            return ["Qwen3TTSForConditionalGeneration"]
         return [self.model_arch]
 
     @property
