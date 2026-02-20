@@ -26,6 +26,36 @@ from vllm_omni.worker.mixins import OmniWorkerMixin
 logger = init_logger(__name__)
 
 
+def _register_qwen3_tts_hf_components() -> None:
+    """Register Qwen3-TTS HF auto classes in worker subprocesses."""
+    try:
+        from transformers import AutoConfig, AutoModel, AutoProcessor
+
+        from vllm_omni.model_executor.models.qwen3_tts.configuration_qwen3_tts import (
+            Qwen3TTSConfig,
+        )
+        from vllm_omni.model_executor.models.qwen3_tts.modeling_qwen3_tts import (
+            Qwen3TTSForConditionalGeneration,
+        )
+        from vllm_omni.model_executor.models.qwen3_tts.processing_qwen3_tts import Qwen3TTSProcessor
+    except Exception as exc:
+        logger.warning("Skipping Qwen3-TTS HF auto registration in generation worker: %s", exc)
+        return
+
+    try:
+        AutoConfig.register("qwen3_tts", Qwen3TTSConfig)
+    except ValueError:
+        pass
+    try:
+        AutoModel.register(Qwen3TTSConfig, Qwen3TTSForConditionalGeneration)
+    except ValueError:
+        pass
+    try:
+        AutoProcessor.register(Qwen3TTSConfig, Qwen3TTSProcessor)
+    except ValueError:
+        pass
+
+
 class GPUGenerationWorker(OmniWorkerMixin, OmniGPUWorkerBase):
     """GPU Worker for Generation model (non-autoregressive waveform generation).
 
@@ -35,6 +65,8 @@ class GPUGenerationWorker(OmniWorkerMixin, OmniGPUWorkerBase):
 
     @instrument(span_name="Init device")
     def init_device(self):
+        _register_qwen3_tts_hf_components()
+
         if self.device_config.device_type == "cuda":
             # This env var set by Ray causes exceptions with graph building.
             os.environ.pop("NCCL_ASYNC_ERROR_HANDLING", None)
