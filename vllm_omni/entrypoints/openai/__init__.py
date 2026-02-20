@@ -9,7 +9,12 @@ Provides:
 - OmniOpenAIServingChat: Unified chat completion handler for both LLM and diffusion models
 """
 
-from vllm_omni.entrypoints.openai.serving_chat import OmniOpenAIServingChat
+try:
+    from vllm_omni.entrypoints.openai.serving_chat import OmniOpenAIServingChat
+except ImportError:
+    # Some chat-serving imports are not compatible with vllm<=0.15.x.
+    # Speech-serving modules should still remain importable.
+    OmniOpenAIServingChat = None
 
 try:
     from vllm_omni.entrypoints.openai.api_server import (
@@ -26,8 +31,10 @@ except ImportError:
 
 __all__ = [
     # Serving classes
-    "OmniOpenAIServingChat",
 ]
+
+if OmniOpenAIServingChat is not None:
+    __all__.append("OmniOpenAIServingChat")
 
 if omni_run_server is not None:
     __all__.extend(
