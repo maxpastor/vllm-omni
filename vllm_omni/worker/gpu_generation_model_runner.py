@@ -7,6 +7,7 @@ This is a non-autoregressive model that doesn't require sampling or logits compu
 from __future__ import annotations
 
 import gc
+import inspect
 import logging
 from copy import copy
 
@@ -546,27 +547,37 @@ class GPUGenerationModelRunner(OmniGPUModelRunner):
 
         num_sampled_tokens = np.ones(num_reqs, dtype=np.int32)
 
-        _cudagraph_mode, batch_desc, should_ubatch, num_tokens_across_dp, _ = (
-            self._determine_batch_execution_and_padding(
-                num_tokens=num_tokens_unpadded,
-                num_reqs=num_reqs,
-                num_scheduled_tokens_np=num_scheduled_tokens,
-                max_num_scheduled_tokens=max_query_len,
-                use_cascade_attn=False,
-                allow_microbatching=allow_microbatching,
-                force_eager=is_profile or (cudagraph_runtime_mode == CUDAGraphMode.NONE),
-                # `force_uniform_decode` is used for cudagraph capture; because for
-                # capturing mixed prefill-decode batches, we sometimes use
-                # num_tokens == num_reqs which looks like a uniform decode batch to the
-                # dispatcher; but we actually want to capture a piecewise cudagraph
-                force_uniform_decode=uniform_decode,
-                # `force_has_lora` is used for cudagraph capture; because LoRA is
-                # activated later in the context manager, but we need to know the
-                # LoRA state when determining the batch descriptor for capture
-                force_has_lora=num_active_loras > 0,
-                # Capture shape specialization for specific active LoRA counts.
-                force_num_active_loras=num_active_loras,
+        determine_batch_kwargs = {
+            "num_tokens": num_tokens_unpadded,
+            "num_reqs": num_reqs,
+            "num_scheduled_tokens_np": num_scheduled_tokens,
+            "max_num_scheduled_tokens": max_query_len,
+            "use_cascade_attn": False,
+            "allow_microbatching": allow_microbatching,
+            "force_eager": is_profile or (cudagraph_runtime_mode == CUDAGraphMode.NONE),
+            # `force_uniform_decode` is used for cudagraph capture; because for
+            # capturing mixed prefill-decode batches, we sometimes use
+            # num_tokens == num_reqs which looks like a uniform decode batch to the
+            # dispatcher; but we actually want to capture a piecewise cudagraph
+            "force_uniform_decode": uniform_decode,
+            # `force_has_lora` is used for cudagraph capture; because LoRA is
+            # activated later in the context manager, but we need to know the
+            # LoRA state when determining the batch descriptor for capture
+            "force_has_lora": num_active_loras > 0,
+            # Capture shape specialization for specific active LoRA counts.
+            "force_num_active_loras": num_active_loras,
+        }
+        determine_batch_params = inspect.signature(self._determine_batch_execution_and_padding).parameters
+        filtered_determine_batch_kwargs = {
+            key: value for key, value in determine_batch_kwargs.items() if key in determine_batch_params
+        }
+        if "force_num_active_loras" not in determine_batch_params:
+            logger.info(
+                "Skipping force_num_active_loras in _determine_batch_execution_and_padding for vLLM API compatibility."
             )
+
+        _cudagraph_mode, batch_desc, should_ubatch, num_tokens_across_dp, _ = (
+            self._determine_batch_execution_and_padding(**filtered_determine_batch_kwargs)
         )
 
         if cudagraph_runtime_mode is None:
