@@ -5,7 +5,13 @@ from vllm.inputs.data import EmbedsInputs, SingletonInputs
 from vllm.inputs.preprocess import InputPreprocessor
 from vllm.logger import init_logger
 from vllm.multimodal.inputs import MultiModalInputs, MultiModalUUIDDict
-from vllm.renderers.inputs import SingletonDictPrompt
+
+try:
+    from vllm.renderers.inputs import SingletonDictPrompt
+except ImportError:  # vllm<=0.15.x
+    from vllm.inputs.data import EmbedsPrompt, TextPrompt, TokensPrompt
+
+    SingletonDictPrompt = TextPrompt | TokensPrompt | EmbedsPrompt
 
 from vllm_omni.inputs.data import (
     OmniEmbedsPrompt,

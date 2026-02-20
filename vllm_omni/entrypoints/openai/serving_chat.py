@@ -68,7 +68,6 @@ from vllm.logger import init_logger
 from vllm.outputs import RequestOutput
 from vllm.reasoning import ReasoningParser
 from vllm.renderers import merge_kwargs
-from vllm.renderers.inputs import TokPrompt
 from vllm.sampling_params import SamplingParams
 from vllm.tokenizers import TokenizerLike
 from vllm.tokenizers import TokenizerLike as AnyTokenizer
@@ -81,6 +80,11 @@ from vllm.tokenizers.mistral import (
 from vllm.tool_parsers import ToolParser
 from vllm.tool_parsers.mistral_tool_parser import MistralToolCall
 from vllm.utils.collection_utils import as_list
+
+try:
+    from vllm.renderers.inputs import TokPrompt
+except ImportError:  # vllm<=0.15.x
+    from vllm.inputs.data import TokensPrompt as TokPrompt
 
 from vllm_omni.entrypoints.openai.audio_utils_mixin import AudioMixin
 from vllm_omni.entrypoints.openai.protocol import OmniChatCompletionStreamResponse

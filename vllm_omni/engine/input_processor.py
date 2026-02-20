@@ -24,12 +24,17 @@ except ImportError:  # vllm without set_request_id (older releases)
 from vllm.multimodal.utils import argsort_mm_positions
 from vllm.platforms import current_platform
 from vllm.pooling_params import PoolingParams
-from vllm.renderers.inputs import DictPrompt, TokPrompt
 from vllm.sampling_params import SamplingParams
 from vllm.tasks import SupportedTask
 from vllm.utils import length_from_prompt_token_ids_or_embeds
 from vllm.utils.torch_utils import set_default_torch_num_threads
 from vllm.v1.engine.input_processor import InputProcessor
+
+try:
+    from vllm.renderers.inputs import DictPrompt, TokPrompt
+except ImportError:  # vllm<=0.15.x
+    from vllm.inputs.data import TextPrompt as DictPrompt
+    from vllm.inputs.data import TokensPrompt as TokPrompt
 
 from vllm_omni.engine import (
     AdditionalInformationEntry,
