@@ -68,6 +68,19 @@ class OmniModelConfig(ModelConfig):
             return ["Qwen3TTSForConditionalGeneration"]
         return [self.model_arch]
 
+    def get_model_arch_config(self):
+        arch_config = super().get_model_arch_config()
+        forced_architectures = self.architectures
+        if arch_config.architectures != forced_architectures:
+            logger.info(
+                "Forcing model architectures %s -> %s for model_stage=%s",
+                arch_config.architectures,
+                forced_architectures,
+                self.model_stage,
+            )
+            arch_config.architectures = forced_architectures
+        return arch_config
+
     @property
     def embedding_size(self):
         if self.hf_config_name is not None:
