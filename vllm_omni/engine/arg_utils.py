@@ -12,6 +12,34 @@ from vllm_omni.plugins import load_omni_general_plugins
 logger = init_logger(__name__)
 
 
+def _with_architecture_override(hf_overrides: Any, model_arch: str) -> Any:
+    """Force HF config architecture to match stage-selected omni model arch."""
+    arch_override = [model_arch]
+    if hf_overrides is None:
+        return {"architectures": arch_override}
+
+    if isinstance(hf_overrides, dict):
+        merged = dict(hf_overrides)
+        merged["architectures"] = arch_override
+        return merged
+
+    if callable(hf_overrides):
+        def _combined_override(cfg: Any) -> Any:
+            updated_cfg = hf_overrides(cfg)
+            target_cfg = cfg if updated_cfg is None else updated_cfg
+            setattr(target_cfg, "architectures", arch_override)
+            return target_cfg
+
+        return _combined_override
+
+    logger.warning(
+        "Unsupported hf_overrides type %s; cannot inject architecture override for %s",
+        type(hf_overrides).__name__,
+        model_arch,
+    )
+    return hf_overrides
+
+
 def _register_omni_hf_configs() -> None:
     try:
         from transformers import AutoConfig
@@ -130,6 +158,9 @@ class OmniEngineArgs(EngineArgs):
         }
         stage_connector_config["extra"]["stage_id"] = self.stage_id
 
+        # Ensure architecture override is applied before ModelConfig init.
+        hf_overrides = _with_architecture_override(self.hf_overrides, self.model_arch)
+
         # Create OmniModelConfig directly from engine args
         # Note: We pass the actual init parameters matching vLLM's EngineArgs.create_model_config()
         omni_config = OmniModelConfig(
@@ -149,7 +180,7 @@ class OmniEngineArgs(EngineArgs):
             revision=self.revision,
             code_revision=self.code_revision,
             hf_token=self.hf_token,
-            hf_overrides=self.hf_overrides,
+            hf_overrides=hf_overrides,
             tokenizer_revision=self.tokenizer_revision,
             max_model_len=self.max_model_len,
             quantization=self.quantization,
@@ -286,6 +317,9 @@ class AsyncOmniEngineArgs(AsyncEngineArgs):
         }
         stage_connector_config["extra"]["stage_id"] = self.stage_id
 
+        # Ensure architecture override is applied before ModelConfig init.
+        hf_overrides = _with_architecture_override(self.hf_overrides, self.model_arch)
+
         # Create OmniModelConfig directly from engine args
         # Note: We pass the actual init parameters matching vLLM's EngineArgs.create_model_config()
         omni_config = OmniModelConfig(
@@ -305,7 +339,7 @@ class AsyncOmniEngineArgs(AsyncEngineArgs):
             revision=self.revision,
             code_revision=self.code_revision,
             hf_token=self.hf_token,
-            hf_overrides=self.hf_overrides,
+            hf_overrides=hf_overrides,
             tokenizer_revision=self.tokenizer_revision,
             max_model_len=self.max_model_len,
             quantization=self.quantization,
