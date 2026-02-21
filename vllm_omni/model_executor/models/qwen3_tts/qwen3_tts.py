@@ -47,6 +47,27 @@ AudioLike = (
 
 MaybeList = Any | list[Any]
 
+VALID_TASK_TYPES = {"CustomVoice", "VoiceDesign", "Base"}
+
+
+def _resolve_default_task_type(model_path: str) -> str:
+    """Resolve a safe default task type from model path metadata."""
+    # Keep prior behavior for HF repo IDs that end with the task suffix.
+    suffix = model_path.rstrip("/").split("-")[-1].strip("/")
+    if suffix in VALID_TASK_TYPES:
+        return suffix
+
+    # Mounted local paths (e.g., /app/model_cache/qwen3_tts_base) do not use
+    # dash suffixes. Choose a robust default that works for warm-up/profile runs.
+    path_token = model_path.rstrip("/").split("/")[-1].lower()
+    normalized = path_token.replace("_", "").replace("-", "")
+    if "voicedesign" in normalized:
+        return "VoiceDesign"
+    if "customvoice" in normalized:
+        return "CustomVoice"
+    # Avoid defaulting to Base here since Base requires clone prompts.
+    return "CustomVoice"
+
 
 @dataclass
 class VoiceClonePromptItem:
@@ -82,7 +103,8 @@ class Qwen3TTSModelForGeneration(nn.Module):
             torch_dtype=torch.bfloat16,
             **attn_kwargs,
         )
-        self.task_type = model_path.split("-")[-1].strip("/")
+        self.task_type = _resolve_default_task_type(model_path)
+        logger.info("Using default task_type=%s for model_path=%s", self.task_type, model_path)
         # Mark that this model produces multimodal outputs
         self.have_multimodal_outputs = True
 
