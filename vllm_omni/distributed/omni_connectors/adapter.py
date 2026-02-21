@@ -15,6 +15,27 @@ from .utils.logging import get_connector_logger
 logger = get_connector_logger(__name__)
 
 
+def get_chunk_for_generation(connector: Any, request: Any) -> None:
+    """Best-effort compatibility shim for scheduler chunk hooks.
+
+    vllm-omni scheduler paths in some branches import this symbol directly.
+    Newer connector implementations may not expose a matching API, so this
+    function safely no-ops unless a compatible method exists.
+    """
+    if connector is None or request is None:
+        return
+
+    try:
+        if hasattr(connector, "get_chunk_for_generation"):
+            connector.get_chunk_for_generation(request)
+            return
+        if hasattr(connector, "get_chunk"):
+            connector.get_chunk(request)
+            return
+    except Exception as e:
+        logger.debug("get_chunk_for_generation shim failed: %s", e)
+
+
 def try_send_via_connector(
     connector: Any,
     stage_id: int,
