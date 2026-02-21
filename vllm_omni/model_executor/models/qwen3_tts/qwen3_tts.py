@@ -61,12 +61,14 @@ def _resolve_default_task_type(model_path: str) -> str:
     # dash suffixes. Choose a robust default that works for warm-up/profile runs.
     path_token = model_path.rstrip("/").split("/")[-1].lower()
     normalized = path_token.replace("_", "").replace("-", "")
+    if "base" in normalized:
+        return "Base"
     if "voicedesign" in normalized:
         return "VoiceDesign"
     if "customvoice" in normalized:
         return "CustomVoice"
-    # Avoid defaulting to Base here since Base requires clone prompts.
-    return "CustomVoice"
+    # Fall back to Base: profile/warm-up path can synthesize with a silent prompt.
+    return "Base"
 
 
 @dataclass
@@ -188,6 +190,11 @@ class Qwen3TTSModelForGeneration(nn.Module):
         if not text:
             logger.info("Profile run detected (empty text). Capping max_new_tokens to 2.")
             extra_kwargs["max_new_tokens"] = 2
+            # vLLM warm-up may omit task_type; avoid hitting CustomVoice-only paths
+            # when running a Base checkpoint.
+            if task_type == "CustomVoice" and getattr(self.model, "tts_model_type", None) == "base":
+                logger.info("Profile run on base model: switching task_type CustomVoice -> Base.")
+                task_type = "Base"
         # Check if this is a streaming request
         if stream:
             return self.forward_streaming(
